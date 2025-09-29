@@ -7,11 +7,9 @@
 #include <ws2ipdef.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
-#include <bcrypt.h>
 #include <wincrypt.h>
-#include <sysinfoapi.h>
 #include <winternl.h>
-#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "wireguard.h"
@@ -40,6 +38,8 @@ static WIREGUARD_SET_CONFIGURATION_FUNC *WireGuardSetConfiguration;
 #ifndef BCRYPT_ECC_CURVE_25519
 #define BCRYPT_ECC_CURVE_25519 L"Curve25519"
 #endif
+
+#define MAX_DNS 2
 
 
 static HMODULE
@@ -133,15 +133,6 @@ LogError(_In_z_ const WCHAR *Prefix, _In_ DWORD Error)
     return Error;
 }
 
-static DWORD
-LogLastError(_In_z_ const WCHAR *Prefix)
-{
-    DWORD LastError = GetLastError();
-    LogError(Prefix, LastError);
-    SetLastError(LastError);
-    return LastError;
-}
-
 static void
 Log(_In_ WIREGUARD_LOGGER_LEVEL Level, _In_z_ const WCHAR *Format, ...)
 {
@@ -151,59 +142,6 @@ Log(_In_ WIREGUARD_LOGGER_LEVEL Level, _In_z_ const WCHAR *Format, ...)
     _vsnwprintf_s(LogLine, _countof(LogLine), _TRUNCATE, Format, args);
     va_end(args);
     ConsoleLogger(Level, Now(), LogLine);
-}
-
-_Must_inspect_result_
-_Return_type_success_(return != FALSE)
-static BOOL
-GenerateKeyPair(
-    _Out_writes_bytes_all_(WIREGUARD_KEY_LENGTH) BYTE PublicKey[WIREGUARD_KEY_LENGTH],
-    _Out_writes_bytes_all_(WIREGUARD_KEY_LENGTH) BYTE PrivateKey[WIREGUARD_KEY_LENGTH])
-{
-    BCRYPT_ALG_HANDLE Algorithm;
-    BCRYPT_KEY_HANDLE Key;
-    NTSTATUS Status;
-    struct
-    {
-        BCRYPT_ECCKEY_BLOB Header;
-        BYTE Public[32];
-        BYTE Unused[32];
-        BYTE Private[32];
-    } ExportedKey;
-    ULONG Bytes;
-
-    Status = BCryptOpenAlgorithmProvider(&Algorithm, BCRYPT_ECDH_ALGORITHM, NULL, 0);
-    if (!NT_SUCCESS(Status))
-        goto out;
-
-    Status = BCryptSetProperty(
-        Algorithm, BCRYPT_ECC_CURVE_NAME, (PUCHAR)BCRYPT_ECC_CURVE_25519, sizeof(BCRYPT_ECC_CURVE_25519), 0);
-    if (!NT_SUCCESS(Status))
-        goto cleanupProvider;
-
-    Status = BCryptGenerateKeyPair(Algorithm, &Key, 255, 0);
-    if (!NT_SUCCESS(Status))
-        goto cleanupProvider;
-
-    Status = BCryptFinalizeKeyPair(Key, 0);
-    if (!NT_SUCCESS(Status))
-        goto cleanupKey;
-
-    Status = BCryptExportKey(Key, NULL, BCRYPT_ECCPRIVATE_BLOB, (PUCHAR)&ExportedKey, sizeof(ExportedKey), &Bytes, 0);
-    if (!NT_SUCCESS(Status))
-        goto cleanupKey;
-
-    memcpy(PublicKey, ExportedKey.Public, WIREGUARD_KEY_LENGTH);
-    memcpy(PrivateKey, ExportedKey.Private, WIREGUARD_KEY_LENGTH);
-    SecureZeroMemory(&ExportedKey, sizeof(ExportedKey));
-
-cleanupKey:
-    BCryptDestroyKey(Key);
-cleanupProvider:
-    BCryptCloseAlgorithmProvider(Algorithm, 0);
-out:
-    SetLastError(RtlNtStatusToDosError(Status));
-    return NT_SUCCESS(Status);
 }
 
 static HANDLE QuitEvent;
@@ -221,56 +159,205 @@ CtrlHandler(_In_ DWORD CtrlType)
         Log(WIREGUARD_LOG_INFO, L"Cleaning up and shutting down");
         SetEvent(QuitEvent);
         return TRUE;
+    default: ;
     }
     return FALSE;
 }
 
-_Return_type_success_(return != FALSE)
-static BOOL
-TalkToDemoServer(
-    _In_reads_bytes_(InputLength) const CHAR *Input,
-    _In_ DWORD InputLength,
-    _Out_writes_bytes_(*OutputLength) CHAR *Output,
-    _Inout_ DWORD *OutputLength,
-    _Out_ SOCKADDR_INET *ResolvedDemoServer)
-{
-    SOCKET Socket = INVALID_SOCKET;
-    ADDRINFOW Hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_protocol = IPPROTO_TCP }, *Resolution;
-    BOOL Ret = FALSE;
+typedef struct _WGAllowedIP {
+    int address_family;       // AF_INET or AF_INET6
+    char ip[64];              // e.g., "192.168.1.2"
+    int cidr;                 // e.g., 24
+} WGAllowedIP;
 
-    if (GetAddrInfoW(L"demo.wireguard.com", L"42912", &Hints, &Resolution))
-        return FALSE;
-    for (ADDRINFOW *Candidate = Resolution; Candidate; Candidate = Candidate->ai_next)
-    {
-        if (Candidate->ai_family != AF_INET && Candidate->ai_family != AF_INET6)
-            continue;
-        Socket = socket(Candidate->ai_family, Candidate->ai_socktype, Candidate->ai_protocol);
-        if (Socket == INVALID_SOCKET)
-            goto cleanupResolution;
-        if (connect(Socket, Candidate->ai_addr, (int)Candidate->ai_addrlen) == SOCKET_ERROR)
-        {
-            closesocket(Socket);
-            Socket = INVALID_SOCKET;
-        }
-        memcpy(ResolvedDemoServer, Candidate->ai_addr, Candidate->ai_addrlen);
-        break;
-    }
-    if (Socket == INVALID_SOCKET)
-        goto cleanupResolution;
-    if (send(Socket, Input, InputLength, 0) == SOCKET_ERROR)
-        goto cleanupSocket;
-    if ((*OutputLength = recv(Socket, Output, *OutputLength, 0)) == SOCKET_ERROR)
-        goto cleanupSocket;
-    Ret = TRUE;
-cleanupSocket:
-    closesocket(Socket);
-cleanupResolution:
-    FreeAddrInfoW(Resolution);
-    return Ret;
+typedef struct _WGServer {
+    char public_key[WIREGUARD_KEY_LENGTH];   // server public key
+    char preshared_key[WIREGUARD_KEY_LENGTH]; // preshared key
+    char host[64];                            // server host (IP or domain)
+    unsigned short port;                      // server port
+    int persistent_keepalive;                 // keepalive interval
+    WGAllowedIP allowed_ip;                   // allowed IP for peer
+} WGServer;
+
+typedef struct _WGInterface {
+    char private_key[WIREGUARD_KEY_LENGTH]; // private key
+    int mtu;                                // MTU
+    char client_ip[64];                     // local IP
+    int client_prefix_length;               // CIDR
+} WGInterface;
+
+typedef struct _WGArgs {
+    WGInterface iface;
+    WGServer server;
+    char dns[64];          // DNS server
+} WGArgs;
+
+int is_valid_ipv4(const char *ip_str) {
+    struct sockaddr_in sa;
+    return inet_pton(AF_INET, ip_str, &(sa.sin_addr)) == 1;
 }
 
-int main(void)
-{
+_Return_type_success_(return != FALSE)
+static BOOL
+parse_args(const int argc, char **argv, WGArgs *wg_args) {
+    if (argc < 10) {
+        Log(WIREGUARD_LOG_ERR, L"Wrong number of arguments", GetLastError());
+        return FALSE;
+    }
+    BYTE decoded[WIREGUARD_KEY_LENGTH];
+    DWORD len = sizeof(decoded);
+
+
+    // parse private and public key
+
+    CryptStringToBinaryA(argv[1], 0, CRYPT_STRING_BASE64, decoded, &len, NULL, NULL);
+    memcpy(wg_args->iface.private_key, decoded, WIREGUARD_KEY_LENGTH);
+
+    len = sizeof(decoded);
+    CryptStringToBinaryA(argv[2], 0, CRYPT_STRING_BASE64, decoded, &len, NULL, NULL);
+    memcpy(wg_args->server.public_key, decoded, WIREGUARD_KEY_LENGTH);
+
+
+    // parse Client Address
+    char *client_address = argv[3];
+    char *slash = strchr(client_address, '/');
+    if (!slash) {
+        Log(WIREGUARD_LOG_ERR, L"Wrong client address", GetLastError());
+        return FALSE;
+    }
+    char client_ip[64];
+    char client_prefix_length_char[3];
+    size_t client_ip_len = slash - client_address;
+    if (client_ip_len >= sizeof(client_ip)) {
+        client_ip_len = sizeof(client_ip) - 1;
+    }
+    memcpy(client_ip, client_address, client_ip_len);
+    client_ip[client_ip_len] = '\0';
+    memcpy(wg_args->iface.client_ip, client_ip, sizeof(wg_args->iface.client_ip)-1);
+
+
+    strncpy(client_prefix_length_char, slash+1, sizeof(client_prefix_length_char) - 1);
+    char *endptr;
+    long client_prefix_length = strtol(client_prefix_length_char, &endptr, 10);
+    if (*endptr != '\0' || client_prefix_length < 0 || client_prefix_length > 32) {
+        Log(WIREGUARD_LOG_ERR, L"Invalid prefix length", GetLastError());
+        return FALSE;
+    }
+    wg_args->iface.client_prefix_length = client_prefix_length;
+
+
+    // parse DNS
+    char *dns_arg = argv[4];
+
+    char dns_copy[256];
+    strncpy(dns_copy, argv[4], sizeof(dns_copy)-1);
+    dns_copy[sizeof(dns_copy)-1] = '\0';
+    char *token = strtok(dns_arg, ",");
+
+    int count = 0;
+
+    while (token != NULL && count < MAX_DNS) {
+        if (!is_valid_ipv4(token)) {
+            Log(WIREGUARD_LOG_ERR, L"Invalid DNS IP: %hs", token);
+            return FALSE;
+        }
+
+        count++;
+        token = strtok(NULL, ",");
+    }
+
+    if (count == 0) {
+        Log(WIREGUARD_LOG_ERR, L"No valid DNS IP provided");
+        return FALSE;
+    }
+    strncpy(wg_args->dns, argv[4], sizeof(wg_args->dns) - 1);
+
+
+    // parse mtu
+    char *mtu_str = argv[5];
+    int mtu = strtol(mtu_str, &endptr, 10);
+    if (*endptr != '\0' || mtu < 0 || mtu > 2000) {
+        Log(WIREGUARD_LOG_ERR, L"Invalid MTU", GetLastError());
+        return FALSE;
+    }
+    wg_args->iface.mtu = mtu;
+
+
+    // parse preshared key
+    len = sizeof(decoded);
+    CryptStringToBinaryA(argv[6], 0, CRYPT_STRING_BASE64, decoded, &len, NULL, NULL);
+    memcpy(wg_args->server.preshared_key, decoded, WIREGUARD_KEY_LENGTH);
+
+
+    // parse allowed ips
+    char *allowed_ips = argv[7];
+    int cidr;
+
+    if (sscanf(allowed_ips, "%63[^/]/%d", wg_args->server.allowed_ip.ip, &cidr) != 2) {
+        Log(WIREGUARD_LOG_ERR, L"Address must contain '/'", GetLastError());
+        return FALSE;
+    }
+
+    if (!is_valid_ipv4(wg_args->server.allowed_ip.ip)) {
+        Log(WIREGUARD_LOG_ERR, L"Invalid IP address", GetLastError());
+        return FALSE;
+    }
+
+    if (cidr < 0 || cidr > 32) {
+        Log(WIREGUARD_LOG_ERR, L"Invalid Allowed CIDR Range", GetLastError());
+        return FALSE;
+    }
+    wg_args->server.allowed_ip.cidr = cidr;
+    wg_args->server.allowed_ip.address_family = AF_INET;
+
+
+    // parse endpoint and port
+    char *_endpoint = argv[8];
+    char host[64];
+    char port_char[16];
+
+    char *colon = strchr(_endpoint, ':'); // find the ':'
+    if (!colon) {
+        Log(WIREGUARD_LOG_ERR, L"Invalid endpoint string", GetLastError());
+        return 1;
+    }
+
+    size_t host_len = colon - _endpoint;
+    if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
+    memcpy(host, _endpoint, host_len);
+    host[host_len] = '\0';
+
+    if (!is_valid_ipv4(host)) {
+        Log(WIREGUARD_LOG_ERR, L"Invalid Endpoint host address", GetLastError());
+        return FALSE;
+    }
+
+    strncpy(port_char, colon + 1, sizeof(port_char) - 1);
+    port_char[sizeof(port_char) - 1] = '\0';
+
+    long port = strtol(port_char, &endptr, 10);
+    if (*endptr != '\0' || port < 0 || port > 65535) {
+        Log(WIREGUARD_LOG_ERR, L"Invalid Server Port", GetLastError());
+        return FALSE;
+    }
+
+    strncpy(wg_args->server.host, host, sizeof(wg_args->server.host) - 1);
+    wg_args->server.port = port;
+
+
+    wg_args->server.persistent_keepalive = atoi(argv[9]);
+
+    return TRUE;
+}
+
+int main(const int argc, char **argv) {
+
+    WGArgs wg_args = {0};
+    if ( !parse_args(argc, argv, &wg_args) ) {
+        Log(WIREGUARD_LOG_ERR, L"Failed to parse arguments", GetLastError());
+        return 1;
+    }
+
     DWORD LastError;
     WSADATA WsaData;
     if (WSAStartup(MAKEWORD(2, 2), &WsaData))
@@ -287,62 +374,38 @@ int main(void)
     struct
     {
         WIREGUARD_INTERFACE Interface;
-        WIREGUARD_PEER DemoServer;
-        WIREGUARD_ALLOWED_IP AllV4;
+        WIREGUARD_PEER Server;
+        WIREGUARD_ALLOWED_IP AllowedIp;
     } Config = { .Interface = { .Flags = WIREGUARD_INTERFACE_HAS_PRIVATE_KEY, .PeersCount = 1 },
-                 .DemoServer = { .Flags = WIREGUARD_PEER_HAS_PUBLIC_KEY | WIREGUARD_PEER_HAS_ENDPOINT,
+                 .Server = { .Flags = WIREGUARD_PEER_HAS_PUBLIC_KEY | WIREGUARD_PEER_HAS_ENDPOINT | WIREGUARD_PEER_HAS_PRESHARED_KEY,
                                  .AllowedIPsCount = 1 },
-                 .AllV4 = { .AddressFamily = AF_INET } };
+                 .AllowedIp = { .AddressFamily = AF_INET} };
 
-    Log(WIREGUARD_LOG_INFO, L"Generating keypair");
-    BYTE PublicKey[WIREGUARD_KEY_LENGTH];
-    if (!GenerateKeyPair(PublicKey, Config.Interface.PrivateKey))
-    {
-        LastError = LogError(L"Failed to generate keypair", GetLastError());
-        goto cleanupWireGuard;
-    }
-    CHAR PublicKeyString[46] = { 0 };
-    DWORD Bytes = sizeof(PublicKeyString);
-    CryptBinaryToStringA(
-        PublicKey, sizeof(PublicKey), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCR, PublicKeyString, &Bytes);
-    CHAR ServerResponse[256] = { 0 };
-    Log(WIREGUARD_LOG_INFO, L"Talking to demo server");
-    Bytes = sizeof(ServerResponse) - 1;
-    if (!TalkToDemoServer(
-            PublicKeyString, (DWORD)strlen(PublicKeyString), ServerResponse, &Bytes, &Config.DemoServer.Endpoint))
-    {
-        LastError = LogError(L"Failed to talk to demo server", GetLastError());
-        goto cleanupWireGuard;
-    }
 
-    CHAR *Colon1 = strchr(ServerResponse, ':');
-    CHAR *Colon2 = Colon1 ? strchr(Colon1 + 1, ':') : NULL;
-    CHAR *Colon3 = Colon2 ? strchr(Colon2 + 1, ':') : NULL;
-    if (!Colon1 || !Colon2 || !Colon3)
-    {
-        LastError = LogError(L"Failed to parse demo server response", ERROR_UNDEFINED_CHARACTER);
-        goto cleanupWireGuard;
-    }
-    if (Bytes && ServerResponse[--Bytes] == '\n')
-        ServerResponse[Bytes] = '\0';
-    *Colon1 = *Colon2 = *Colon3 = '\0';
+    memcpy(Config.Server.PublicKey, wg_args.server.public_key, WIREGUARD_KEY_LENGTH);
+    memcpy(Config.Interface.PrivateKey, wg_args.iface.private_key, WIREGUARD_KEY_LENGTH);
+    memcpy(Config.Server.PresharedKey, wg_args.server.preshared_key, WIREGUARD_KEY_LENGTH);
+
+
+    Config.AllowedIp.AddressFamily = wg_args.server.allowed_ip.address_family;
+    inet_pton(Config.AllowedIp.AddressFamily, wg_args.server.allowed_ip.ip, &Config.AllowedIp.Address.V4);
+    Config.AllowedIp.Cidr = (BYTE)wg_args.server.allowed_ip.cidr;
+
+    Config.Server.PersistentKeepalive = wg_args.server.persistent_keepalive;
+
+    Config.Server.Endpoint.si_family = AF_INET;
+    Config.Server.Endpoint.Ipv4.sin_family = AF_INET;
+    Config.Server.Endpoint.Ipv4.sin_port = htons(wg_args.server.port);
+    InetPtonA(AF_INET, wg_args.server.host, &Config.Server.Endpoint.Ipv4.sin_addr);
 
     MIB_UNICASTIPADDRESS_ROW AddressRow;
     InitializeUnicastIpAddressEntry(&AddressRow);
     AddressRow.Address.Ipv4.sin_family = AF_INET;
-    AddressRow.OnLinkPrefixLength = 24; /* This is a /24 network */
+    InetPtonA(AF_INET, wg_args.iface.client_ip, &AddressRow.Address.Ipv4.sin_addr);
+    AddressRow.OnLinkPrefixLength = wg_args.iface.client_prefix_length;
     AddressRow.DadState = IpDadStatePreferred;
-    Bytes = sizeof(Config.DemoServer.PublicKey);
-    if (strcmp(ServerResponse, "OK") || InetPtonA(AF_INET, Colon3 + 1, &AddressRow.Address.Ipv4.sin_addr) != 1 ||
-        !CryptStringToBinaryA(Colon1 + 1, 0, CRYPT_STRING_BASE64, Config.DemoServer.PublicKey, &Bytes, NULL, NULL))
-    {
-        LastError = LogError(L"Failed to parse demo server response", ERROR_UNDEFINED_CHARACTER);
-        goto cleanupWireGuard;
-    }
-    if (Config.DemoServer.Endpoint.si_family == AF_INET)
-        Config.DemoServer.Endpoint.Ipv4.sin_port = htons((u_short)atoi(Colon2 + 1));
-    else if (Config.DemoServer.Endpoint.si_family == AF_INET6)
-        Config.DemoServer.Endpoint.Ipv6.sin6_port = htons((u_short)atoi(Colon2 + 1));
+
+    DWORD Bytes = sizeof(Config.Server.PublicKey);
 
     QuitEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!QuitEvent)
@@ -357,7 +420,7 @@ int main(void)
     }
 
     GUID ExampleGuid = { 0xdeadc001, 0xbeef, 0xbabe, { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef } };
-    WIREGUARD_ADAPTER_HANDLE Adapter = WireGuardCreateAdapter(L"Demo", L"Example", &ExampleGuid);
+    WIREGUARD_ADAPTER_HANDLE Adapter = WireGuardCreateAdapter(L"Omamori", L"Tunnel-1", &ExampleGuid);
     if (!Adapter)
     {
         LastError = GetLastError();
@@ -402,7 +465,7 @@ int main(void)
     }
     IpInterface.UseAutomaticMetric = FALSE;
     IpInterface.Metric = 0;
-    IpInterface.NlMtu = 1420;
+    IpInterface.NlMtu = wg_args.iface.mtu;
     IpInterface.SitePrefixLength = 0;
     LastError = SetIpInterfaceEntry(&IpInterface);
     if (LastError != ERROR_SUCCESS)
@@ -440,8 +503,8 @@ int main(void)
             SystemTime.wMinute,
             SystemTime.wSecond,
             SystemTime.wMilliseconds,
-            Config.DemoServer.RxBytes,
-            Config.DemoServer.TxBytes);
+            Config.Server.RxBytes,
+            Config.Server.TxBytes);
     } while (WaitForSingleObject(QuitEvent, 1000) == WAIT_TIMEOUT);
 
 cleanupAdapter:
