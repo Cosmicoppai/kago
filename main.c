@@ -2,17 +2,20 @@
  Modified for the use case of Omamori
  */
 
+// TODO standard logging
 #include <winsock2.h>
 #include <Windows.h>
 #include <ws2ipdef.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <math.h>
 #include <wincrypt.h>
 #include <winternl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "wireguard.h"
+#include "utils.h"
 
 static WIREGUARD_CREATE_ADAPTER_FUNC *WireGuardCreateAdapter;
 static WIREGUARD_OPEN_ADAPTER_FUNC *WireGuardOpenAdapter;
@@ -39,8 +42,7 @@ static WIREGUARD_SET_CONFIGURATION_FUNC *WireGuardSetConfiguration;
 #define BCRYPT_ECC_CURVE_25519 L"Curve25519"
 #endif
 
-#define MAX_DNS 2
-
+InterfaceInfo Interface_INFO = {0};
 
 static HMODULE
 InitializeWireGuardNT(void)
@@ -190,11 +192,61 @@ typedef struct _WGArgs {
     WGInterface iface;
     WGServer server;
     char dns[64];          // DNS server
+    char dns2[64];
 } WGArgs;
 
 int is_valid_ipv4(const char *ip_str) {
     struct sockaddr_in sa;
     return inet_pton(AF_INET, ip_str, &(sa.sin_addr)) == 1;
+}
+
+_Return_type_success_(return != FALSE)
+static BOOL
+updateDNS(char dns1[], char dns2[]) {
+
+    Interface_INFO = get_internet_adapter_info();
+    char adapter[256];
+    strncpy(adapter, Interface_INFO.InterfaceName, sizeof adapter - 1);
+    adapter[sizeof(adapter) - 1] = 0;
+
+    char cmd[256];
+    int cmd_success = 1;
+    printf("Current DNS1: %s\n", Interface_INFO.DNS1);
+    printf("Current DNS2: %s\n", Interface_INFO.DNS2);
+
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ip set dns name=\"%s\" static %s primary",
+             adapter, dns1);
+    cmd_success = system(cmd);
+    if (!cmd_success) {
+        Log(WIREGUARD_LOG_ERR, L"Failed to update DNS1");
+        return FALSE;
+    }
+
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ip add dns name=\"%s\" %s index=2",
+             adapter, dns2);
+    cmd_success = system(cmd);
+    if (!cmd_success) {
+        Log(WIREGUARD_LOG_ERR, L"Failed to update DNS2");
+        return FALSE;
+    }
+
+    system("ipconfig /flushdns");
+
+    Log(WIREGUARD_LOG_INFO, L"New DNS applied and flushed");
+
+    return TRUE;
+}
+
+_Return_type_success_(return != FALSE)
+static BOOL
+revertDNS() {
+    if ( strlen(Interface_INFO.DNS1) > 0 && strlen(Interface_INFO.DNS2) > 0 ) {
+        return updateDNS(Interface_INFO.DNS1, Interface_INFO.DNS2);
+    }
+    return TRUE;
+
 }
 
 _Return_type_success_(return != FALSE)
@@ -247,31 +299,26 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
 
 
     // parse DNS
-    char *dns_arg = argv[4];
-
-    char dns_copy[256];
-    strncpy(dns_copy, argv[4], sizeof(dns_copy)-1);
-    dns_copy[sizeof(dns_copy)-1] = '\0';
-    char *token = strtok(dns_arg, ",");
-
+    char *token = strtok(argv[4], ",");
     int count = 0;
+    char dns_array[2][65] = {"10.66.66.1", "10.66.66.1"};
 
     while (token != NULL && count < MAX_DNS) {
         if (!is_valid_ipv4(token)) {
             Log(WIREGUARD_LOG_ERR, L"Invalid DNS IP: %hs", token);
-            return FALSE;
+        } else {
+            strncpy(dns_array[count], token, sizeof(dns_array[count]) - 1);
+            dns_array[count][sizeof(dns_array[count]) - 1] = '\0';
         }
-
         count++;
+        if ( count == 2 ) {
+            break;
+        }
         token = strtok(NULL, ",");
     }
 
-    if (count == 0) {
-        Log(WIREGUARD_LOG_ERR, L"No valid DNS IP provided");
-        return FALSE;
-    }
-    strncpy(wg_args->dns, argv[4], sizeof(wg_args->dns) - 1);
-
+    strncpy(wg_args->dns, dns_array[0], sizeof(wg_args->dns) - 1);
+    strncpy(wg_args->dns2, dns_array[1], sizeof(wg_args->dns2) - 1);
 
     // parse mtu
     char *mtu_str = argv[5];
@@ -370,6 +417,8 @@ int main(const int argc, char **argv) {
     }
     WireGuardSetLogger(ConsoleLogger);
     Log(WIREGUARD_LOG_INFO, L"WireGuardNT library loaded");
+
+    updateDNS(wg_args.dns, wg_args.dns2);
 
     struct
     {
@@ -509,11 +558,14 @@ int main(const int argc, char **argv) {
 
 cleanupAdapter:
     WireGuardCloseAdapter(Adapter);
+    revertDNS();
 cleanupQuit:
     SetConsoleCtrlHandler(CtrlHandler, FALSE);
     CloseHandle(QuitEvent);
+    revertDNS();
 cleanupWireGuard:
     FreeLibrary(WireGuard);
+    revertDNS();
 cleanupWinsock:
     WSACleanup();
     return LastError;
