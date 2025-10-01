@@ -2,7 +2,6 @@
  Modified for the use case of Omamori
  */
 
-// TODO standard logging
 #include <winsock2.h>
 #include <Windows.h>
 #include <ws2ipdef.h>
@@ -16,6 +15,7 @@
 #include <stdlib.h>
 #include "wireguard.h"
 #include "utils.h"
+#include "logging.h"
 
 static WIREGUARD_CREATE_ADAPTER_FUNC *WireGuardCreateAdapter;
 static WIREGUARD_OPEN_ADAPTER_FUNC *WireGuardOpenAdapter;
@@ -42,7 +42,7 @@ static WIREGUARD_SET_CONFIGURATION_FUNC *WireGuardSetConfiguration;
 #define BCRYPT_ECC_CURVE_25519 L"Curve25519"
 #endif
 
-InterfaceInfo Interface_INFO = {0};
+InterfaceInfo LOCAL_INTERFACE_INFO = {0};
 
 static HMODULE
 InitializeWireGuardNT(void)
@@ -66,86 +66,6 @@ InitializeWireGuardNT(void)
     return WireGuardDll;
 }
 
-static void CALLBACK
-ConsoleLogger(_In_ WIREGUARD_LOGGER_LEVEL Level, _In_ DWORD64 Timestamp, _In_z_ const WCHAR *LogLine)
-{
-    SYSTEMTIME SystemTime;
-    FileTimeToSystemTime((FILETIME *)&Timestamp, &SystemTime);
-    WCHAR LevelMarker;
-    switch (Level)
-    {
-    case WIREGUARD_LOG_INFO:
-        LevelMarker = L'+';
-        break;
-    case WIREGUARD_LOG_WARN:
-        LevelMarker = L'-';
-        break;
-    case WIREGUARD_LOG_ERR:
-        LevelMarker = L'!';
-        break;
-    default:
-        return;
-    }
-    fwprintf(
-        stderr,
-        L"%04u-%02u-%02u %02u:%02u:%02u.%04u [%c] %s\n",
-        SystemTime.wYear,
-        SystemTime.wMonth,
-        SystemTime.wDay,
-        SystemTime.wHour,
-        SystemTime.wMinute,
-        SystemTime.wSecond,
-        SystemTime.wMilliseconds,
-        LevelMarker,
-        LogLine);
-}
-
-static DWORD64 Now(VOID)
-{
-    LARGE_INTEGER Timestamp;
-    NtQuerySystemTime(&Timestamp);
-    return Timestamp.QuadPart;
-}
-
-static DWORD
-LogError(_In_z_ const WCHAR *Prefix, _In_ DWORD Error)
-{
-    WCHAR *SystemMessage = NULL, *FormattedMessage = NULL;
-    FormatMessageW(
-        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_MAX_WIDTH_MASK,
-        NULL,
-        HRESULT_FROM_SETUPAPI(Error),
-        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-        (void *)&SystemMessage,
-        0,
-        NULL);
-    FormatMessageW(
-        FORMAT_MESSAGE_FROM_STRING | FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_ARGUMENT_ARRAY |
-            FORMAT_MESSAGE_MAX_WIDTH_MASK,
-        SystemMessage ? L"%1: %3(Code 0x%2!08X!)" : L"%1: Code 0x%2!08X!",
-        0,
-        0,
-        (void *)&FormattedMessage,
-        0,
-        (va_list *)(DWORD_PTR[]){ (DWORD_PTR)Prefix, (DWORD_PTR)Error, (DWORD_PTR)SystemMessage });
-    if (FormattedMessage)
-        ConsoleLogger(WIREGUARD_LOG_ERR, Now(), FormattedMessage);
-    LocalFree(FormattedMessage);
-    LocalFree(SystemMessage);
-    return Error;
-}
-
-static void
-Log(_In_ WIREGUARD_LOGGER_LEVEL Level, _In_z_ const WCHAR *Format, ...)
-{
-    WCHAR LogLine[0x200];
-    va_list args;
-    va_start(args, Format);
-    _vsnwprintf_s(LogLine, _countof(LogLine), _TRUNCATE, Format, args);
-    va_end(args);
-    ConsoleLogger(Level, Now(), LogLine);
-}
-
 static HANDLE QuitEvent;
 
 static BOOL WINAPI
@@ -158,7 +78,7 @@ CtrlHandler(_In_ DWORD CtrlType)
     case CTRL_CLOSE_EVENT:
     case CTRL_LOGOFF_EVENT:
     case CTRL_SHUTDOWN_EVENT:
-        Log(WIREGUARD_LOG_INFO, L"Cleaning up and shutting down");
+        Log(LOG_INFO, L"Cleaning up and shutting down");
         SetEvent(QuitEvent);
         return TRUE;
     default: ;
@@ -203,38 +123,33 @@ int is_valid_ipv4(const char *ip_str) {
 _Return_type_success_(return != FALSE)
 static BOOL
 updateDNS(char dns1[], char dns2[]) {
-
-    Interface_INFO = get_internet_adapter_info();
-    char adapter[256];
-    strncpy(adapter, Interface_INFO.InterfaceName, sizeof adapter - 1);
-    adapter[sizeof(adapter) - 1] = 0;
-
     char cmd[256];
-    int cmd_success = 1;
-    printf("Current DNS1: %s\n", Interface_INFO.DNS1);
-    printf("Current DNS2: %s\n", Interface_INFO.DNS2);
-
     snprintf(cmd, sizeof(cmd),
              "netsh interface ip set dns name=\"%s\" static %s primary",
-             adapter, dns1);
-    cmd_success = system(cmd);
-    if (!cmd_success) {
-        Log(WIREGUARD_LOG_ERR, L"Failed to update DNS1");
+             LOCAL_INTERFACE_INFO.InterfaceName, dns1);
+    int cmd_success = system(cmd);
+    if (cmd_success != 0) {
+        Log(LOG_ERR, L"Failed to update DNS1");
         return FALSE;
+    }
+
+    if ( strcmp(dns1, dns2) == 0 ) {
+        Log(LOG_INFO, L"DNS1 and DNS2 are identical, Skipping setting DNS2");
+        return TRUE;
     }
 
     snprintf(cmd, sizeof(cmd),
              "netsh interface ip add dns name=\"%s\" %s index=2",
-             adapter, dns2);
+             LOCAL_INTERFACE_INFO.InterfaceName, dns2);
     cmd_success = system(cmd);
-    if (!cmd_success) {
-        Log(WIREGUARD_LOG_ERR, L"Failed to update DNS2");
+    if (cmd_success != 0) {
+        Log(LOG_ERR, L"Failed to update DNS2");
         return FALSE;
     }
 
     system("ipconfig /flushdns");
 
-    Log(WIREGUARD_LOG_INFO, L"New DNS applied and flushed");
+    Log(LOG_INFO, L"New DNS applied and flushed");
 
     return TRUE;
 }
@@ -242,8 +157,8 @@ updateDNS(char dns1[], char dns2[]) {
 _Return_type_success_(return != FALSE)
 static BOOL
 revertDNS() {
-    if ( strlen(Interface_INFO.DNS1) > 0 && strlen(Interface_INFO.DNS2) > 0 ) {
-        return updateDNS(Interface_INFO.DNS1, Interface_INFO.DNS2);
+    if ( strlen(LOCAL_INTERFACE_INFO.DNS1) > 0 && strlen(LOCAL_INTERFACE_INFO.DNS2) > 0 ) {
+        return updateDNS(LOCAL_INTERFACE_INFO.DNS1, LOCAL_INTERFACE_INFO.DNS2);
     }
     return TRUE;
 
@@ -253,7 +168,7 @@ _Return_type_success_(return != FALSE)
 static BOOL
 parse_args(const int argc, char **argv, WGArgs *wg_args) {
     if (argc < 10) {
-        Log(WIREGUARD_LOG_ERR, L"Wrong number of arguments", GetLastError());
+        Log(LOG_ERR, L"Wrong number of arguments", GetLastError());
         return FALSE;
     }
     BYTE decoded[WIREGUARD_KEY_LENGTH];
@@ -274,7 +189,7 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
     char *client_address = argv[3];
     char *slash = strchr(client_address, '/');
     if (!slash) {
-        Log(WIREGUARD_LOG_ERR, L"Wrong client address", GetLastError());
+        Log(LOG_ERR, L"Wrong client address", GetLastError());
         return FALSE;
     }
     char client_ip[64];
@@ -292,7 +207,7 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
     char *endptr;
     long client_prefix_length = strtol(client_prefix_length_char, &endptr, 10);
     if (*endptr != '\0' || client_prefix_length < 0 || client_prefix_length > 32) {
-        Log(WIREGUARD_LOG_ERR, L"Invalid prefix length", GetLastError());
+        Log(LOG_ERR, L"Invalid prefix length", GetLastError());
         return FALSE;
     }
     wg_args->iface.client_prefix_length = client_prefix_length;
@@ -305,7 +220,7 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
 
     while (token != NULL && count < MAX_DNS) {
         if (!is_valid_ipv4(token)) {
-            Log(WIREGUARD_LOG_ERR, L"Invalid DNS IP: %hs", token);
+            Log(LOG_ERR, L"Invalid DNS IP: %hs", token);
         } else {
             strncpy(dns_array[count], token, sizeof(dns_array[count]) - 1);
             dns_array[count][sizeof(dns_array[count]) - 1] = '\0';
@@ -324,7 +239,7 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
     char *mtu_str = argv[5];
     int mtu = strtol(mtu_str, &endptr, 10);
     if (*endptr != '\0' || mtu < 0 || mtu > 2000) {
-        Log(WIREGUARD_LOG_ERR, L"Invalid MTU", GetLastError());
+        Log(LOG_ERR, L"Invalid MTU", GetLastError());
         return FALSE;
     }
     wg_args->iface.mtu = mtu;
@@ -341,17 +256,17 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
     int cidr;
 
     if (sscanf(allowed_ips, "%63[^/]/%d", wg_args->server.allowed_ip.ip, &cidr) != 2) {
-        Log(WIREGUARD_LOG_ERR, L"Address must contain '/'", GetLastError());
+        Log(LOG_ERR, L"Address must contain '/'", GetLastError());
         return FALSE;
     }
 
     if (!is_valid_ipv4(wg_args->server.allowed_ip.ip)) {
-        Log(WIREGUARD_LOG_ERR, L"Invalid IP address", GetLastError());
+        Log(LOG_ERR, L"Invalid IP address", GetLastError());
         return FALSE;
     }
 
     if (cidr < 0 || cidr > 32) {
-        Log(WIREGUARD_LOG_ERR, L"Invalid Allowed CIDR Range", GetLastError());
+        Log(LOG_ERR, L"Invalid Allowed CIDR Range", GetLastError());
         return FALSE;
     }
     wg_args->server.allowed_ip.cidr = cidr;
@@ -365,7 +280,7 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
 
     char *colon = strchr(_endpoint, ':'); // find the ':'
     if (!colon) {
-        Log(WIREGUARD_LOG_ERR, L"Invalid endpoint string", GetLastError());
+        Log(LOG_ERR, L"Invalid endpoint string", GetLastError());
         return 1;
     }
 
@@ -375,7 +290,7 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
     host[host_len] = '\0';
 
     if (!is_valid_ipv4(host)) {
-        Log(WIREGUARD_LOG_ERR, L"Invalid Endpoint host address", GetLastError());
+        Log(LOG_ERR, L"Invalid Endpoint host address", GetLastError());
         return FALSE;
     }
 
@@ -384,7 +299,7 @@ parse_args(const int argc, char **argv, WGArgs *wg_args) {
 
     long port = strtol(port_char, &endptr, 10);
     if (*endptr != '\0' || port < 0 || port > 65535) {
-        Log(WIREGUARD_LOG_ERR, L"Invalid Server Port", GetLastError());
+        Log(LOG_ERR, L"Invalid Server Port", GetLastError());
         return FALSE;
     }
 
@@ -401,7 +316,7 @@ int main(const int argc, char **argv) {
 
     WGArgs wg_args = {0};
     if ( !parse_args(argc, argv, &wg_args) ) {
-        Log(WIREGUARD_LOG_ERR, L"Failed to parse arguments", GetLastError());
+        Log(LOG_ERR, L"Failed to parse arguments", GetLastError());
         return 1;
     }
 
@@ -416,9 +331,9 @@ int main(const int argc, char **argv) {
         goto cleanupWinsock;
     }
     WireGuardSetLogger(ConsoleLogger);
-    Log(WIREGUARD_LOG_INFO, L"WireGuardNT library loaded");
+    Log(LOG_INFO, L"WireGuardNT library loaded");
 
-    updateDNS(wg_args.dns, wg_args.dns2);
+    LOCAL_INTERFACE_INFO = get_internet_adapter_info();
 
     struct
     {
@@ -481,7 +396,7 @@ int main(const int argc, char **argv) {
         LogError(L"Failed to enable adapter logging", GetLastError());
 
     DWORD Version = WireGuardGetRunningDriverVersion();
-    Log(WIREGUARD_LOG_INFO, L"WireGuardNT v%u.%u loaded", (Version >> 16) & 0xff, (Version >> 0) & 0xff);
+    Log(LOG_INFO, L"WireGuardNT v%u.%u loaded", (Version >> 16) & 0xff, (Version >> 0) & 0xff);
 
     WireGuardGetAdapterLUID(Adapter, &AddressRow.InterfaceLuid);
     MIB_IPFORWARD_ROW2 DefaultRoute = { 0 };
@@ -523,13 +438,15 @@ int main(const int argc, char **argv) {
         goto cleanupAdapter;
     }
 
-    Log(WIREGUARD_LOG_INFO, L"Setting configuration and adapter up");
+    Log(LOG_INFO, L"Setting configuration and adapter up");
     if (!WireGuardSetConfiguration(Adapter, &Config.Interface, sizeof(Config)) ||
         !WireGuardSetAdapterState(Adapter, WIREGUARD_ADAPTER_STATE_UP))
     {
         LastError = LogError(L"Failed to set configuration and adapter up", GetLastError());
         goto cleanupAdapter;
     }
+
+    updateDNS(wg_args.dns, wg_args.dns2);
 
     do
     {
@@ -539,21 +456,13 @@ int main(const int argc, char **argv) {
             LastError = LogError(L"Failed to get configuration", GetLastError());
             goto cleanupAdapter;
         }
-        DWORD64 Timestamp = Now();
-        SYSTEMTIME SystemTime;
-        FileTimeToSystemTime((FILETIME *)&Timestamp, &SystemTime);
-        fwprintf(
-            stderr,
-            L"%04u-%02u-%02u %02u:%02u:%02u.%04u [#] RX: %llu, TX: %llu\r",
-            SystemTime.wYear,
-            SystemTime.wMonth,
-            SystemTime.wDay,
-            SystemTime.wHour,
-            SystemTime.wMinute,
-            SystemTime.wSecond,
-            SystemTime.wMilliseconds,
-            Config.Server.RxBytes,
-            Config.Server.TxBytes);
+
+        wchar_t log_buffer[256];
+        swprintf(log_buffer, sizeof(log_buffer) / sizeof(wchar_t),
+            L"upload: %llu download: %llu", Config.Server.RxBytes, Config.Server.TxBytes);
+
+        Log(LOG_DATA, log_buffer);
+
     } while (WaitForSingleObject(QuitEvent, 1000) == WAIT_TIMEOUT);
 
 cleanupAdapter:
@@ -562,10 +471,8 @@ cleanupAdapter:
 cleanupQuit:
     SetConsoleCtrlHandler(CtrlHandler, FALSE);
     CloseHandle(QuitEvent);
-    revertDNS();
 cleanupWireGuard:
     FreeLibrary(WireGuard);
-    revertDNS();
 cleanupWinsock:
     WSACleanup();
     return LastError;

@@ -11,6 +11,8 @@
 #include <ifdef.h>
 #include <ws2ipdef.h>
 
+#include "logging.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -132,7 +134,7 @@ typedef enum
  * @param Message       Message text.
  */
 typedef VOID(CALLBACK *WIREGUARD_LOGGER_CALLBACK)(
-    _In_ WIREGUARD_LOGGER_LEVEL Level,
+    _In_ LOGGER_LEVEL Level,
     _In_ DWORD64 Timestamp,
     _In_z_ LPCWSTR Message);
 

@@ -30,7 +30,7 @@ InterfaceInfo get_internet_adapter_info() {
     }
 
     ULONG outBufLen = 15000;
-    IP_ADAPTER_ADDRESSES* adapters = (IP_ADAPTER_ADDRESSES*)malloc(outBufLen);
+    IP_ADAPTER_ADDRESSES* adapters = malloc(outBufLen);
     if (!adapters) return info;
 
     if (GetAdaptersAddresses(AF_UNSPEC, 0, NULL, adapters, &outBufLen) != NO_ERROR) {
