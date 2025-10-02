@@ -1,6 +1,4 @@
-```text
-Simple Command Line Wireguard Client for Windows
-```
+## Simple Command Line Wireguard Client for Windows
 
 ## To Compile
 
